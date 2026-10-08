@@ -1,5 +1,5 @@
 from qdrant_client.http.models import models
-from qdrant_client.local.payload_filters import check_filter
+from qdrant_client.local.payload_filters import check_filter, check_match
 
 
 def test_nested_payload_filters():
@@ -79,7 +79,7 @@ def test_nested_payload_filters():
                                         "gte": 1.0,
                                     },
                                 }
-                            ]
+                            ],
                         },
                     }
                 }
@@ -105,7 +105,7 @@ def test_nested_payload_filters():
                                     },
                                 },
                                 {"key": "sightseeing", "values_count": {"gt": 2}},
-                            ]
+                            ],
                         },
                     }
                 }
@@ -130,7 +130,7 @@ def test_nested_payload_filters():
                                         "gte": 9.0,
                                     },
                                 }
-                            ]
+                            ],
                         },
                     }
                 }
@@ -187,3 +187,243 @@ def test_geo_polygon_filter_query():
 
     res = check_filter(query, payload, 0, has_vector={})
     assert res is False
+
+
+def text(query: str) -> models.MatchText:
+    return models.MatchText(text=query)
+
+
+def phrase(query: str) -> models.MatchPhrase:
+    return models.MatchPhrase(phrase=query)
+
+
+def test_text_match_uses_token_matching_not_substring():
+    """On a field without a text index the server matches whole tokens, not substrings
+    (qdrant#10341). Cases mirror the server's own `unindexed_text_match_test.rs`.
+    """
+    assert not check_match(text("good"), "goodness only")
+    assert check_match(text("good"), "good cheap stuff")
+    assert check_match(text("good cheap"), "cheap hardware good")
+    assert not check_match(text("good cheap"), "cheap hardware")
+
+    # tokenization: split on non-alphanumeric, lowercase
+    assert check_match(text("FLY"), "fly agaric")
+    assert check_match(text("fly"), "come fly, with me")
+    assert not check_match(text("fly"), "butterfly dragonfly")
+    assert not check_match(text(""), "anything")
+    assert not check_match(text("fly"), 7)
+
+
+def test_phrase_match_requires_token_order():
+    assert check_match(phrase("alpha beta"), "foo alpha beta bar")
+    assert not check_match(phrase("alpha beta"), "beta alpha")
+    assert not check_match(phrase("alpha beta"), "alphabeta")
+    # consecutive, not merely in order: an ordered subsequence is not a phrase
+    assert not check_match(phrase("alpha x beta"), "alpha x beta")
+    assert not check_match(phrase("good"), "goodness only")
+    assert check_match(phrase("good"), "goodness only good")
+
+    assert check_match(phrase("Alpha, Beta!"), "alpha beta")
+    assert not check_match(phrase(""), "anything")
+    assert not check_match(phrase("alpha"), None)
+
+
+def test_text_any_match_needs_only_one_token():
+    """Like text and phrase, `MatchTextAny` on an unindexed field matches whole tokens
+    rather than substrings (qdrant#10526), but one query token is enough.
+    """
+    text_any = models.MatchTextAny
+
+    # a substring of a document token is not a match
+    assert not check_match(text_any(text_any="good fly"), "goodness only")
+    assert not check_match(text_any(text_any="fly"), "butterfly")
+    assert not check_match(text_any(text_any="cheap"), "goodness only")
+
+    # any single query token is enough, unlike `MatchText`, which requires all of them
+    assert check_match(text_any(text_any="good fly"), "good cheap stuff")
+    assert check_match(text_any(text_any="good fly"), "come fly, with me")
+    assert not check_match(text_any(text_any="good fly"), "cheap hardware")
+
+    # tokenization applies to both sides, lowercasing included
+    assert check_match(text_any(text_any="Alpha, Beta!"), "beta")
+    assert not check_match(text_any(text_any=""), "anything")
+    assert not check_match(text_any(text_any="alpha"), None)
+
+
+def matching_ids(flt: models.Filter, payloads: dict) -> list:
+    return [
+        idx for idx, payload in payloads.items() if check_filter(flt, payload, idx, has_vector={})
+    ]
+
+
+EMPTY_NULL_PAYLOADS = {
+    1: {"reports": [1, 2]},  # non-empty array: neither empty nor null
+    2: {"reports": []},  # empty array: empty, not null
+    3: {"reports": None},  # null: both empty and null
+    4: {},  # key absent: empty, not null
+    5: {"reports": [None, 1]},  # array holding a null: not empty, but null
+}
+
+
+def is_empty_null_filter(flag: str, value: bool) -> models.Filter:
+    return models.Filter(must=[models.FieldCondition(key="reports", **{flag: value})])
+
+
+def test_field_condition_is_empty():
+    # `FieldCondition.is_empty` is the shorthand syntax for `IsEmptyCondition`, and on a key
+    # holding a single value the two agree.
+    assert matching_ids(is_empty_null_filter("is_empty", True), EMPTY_NULL_PAYLOADS) == [2, 3, 4]
+    assert matching_ids(is_empty_null_filter("is_empty", False), EMPTY_NULL_PAYLOADS) == [1, 5]
+
+    negated = models.Filter(must_not=[models.FieldCondition(key="reports", is_empty=True)])
+    assert matching_ids(negated, EMPTY_NULL_PAYLOADS) == [1, 5]
+
+    verbose = models.Filter(
+        must=[models.IsEmptyCondition(is_empty=models.PayloadField(key="reports"))]
+    )
+    assert matching_ids(verbose, EMPTY_NULL_PAYLOADS) == [2, 3, 4]
+
+
+def test_field_condition_is_null():
+    # `FieldCondition.is_null` matches a null value, or an array containing one. An absent
+    # key is not null.
+    assert matching_ids(is_empty_null_filter("is_null", True), EMPTY_NULL_PAYLOADS) == [3, 5]
+    assert matching_ids(is_empty_null_filter("is_null", False), EMPTY_NULL_PAYLOADS) == [1, 2, 4]
+
+    negated = models.Filter(must_not=[models.FieldCondition(key="reports", is_null=True)])
+    assert matching_ids(negated, EMPTY_NULL_PAYLOADS) == [1, 2, 4]
+
+    verbose = models.Filter(
+        must=[models.IsNullCondition(is_null=models.PayloadField(key="reports"))]
+    )
+    assert matching_ids(verbose, EMPTY_NULL_PAYLOADS) == [3, 5]
+
+
+def test_field_condition_is_empty_is_null_json_path():
+    payloads = {
+        1: {"a": [{"b": 1}, {"b": None}]},
+        2: {"a": [{"b": 1}, {"b": 2}]},
+        3: {"a": []},
+        4: {"a": [{"b": []}, {"b": 1}]},
+        5: {"a": [{"b": []}]},
+    }
+
+    def matches(flag: str, value: bool) -> list:
+        return matching_ids(
+            models.Filter(must=[models.FieldCondition(key="a[].b", **{flag: value})]), payloads
+        )
+
+    assert matches("is_null", True) == [1]
+    assert matches("is_null", False) == [2, 3, 4, 5]
+
+    assert matches("is_empty", True) == [3, 5]
+    assert matches("is_empty", False) == [1, 2, 4]
+
+    verbose_empty = models.Filter(
+        must=[models.IsEmptyCondition(is_empty=models.PayloadField(key="a[].b"))]
+    )
+    assert matching_ids(verbose_empty, payloads) == matches("is_empty", True)
+
+    verbose_null = models.Filter(
+        must=[models.IsNullCondition(is_null=models.PayloadField(key="a[].b"))]
+    )
+    assert matching_ids(verbose_null, payloads) == matches("is_null", True)
+
+
+def test_geo_filters_ignore_nonfinite_coordinates():
+    """A coordinate outside the float range matches nothing and does not stop the other
+    stored locations from matching (qdrant-client#1422): the geometry raises ValueError on
+    an infinity and OverflowError on an oversized integer. Only local mode sees these
+    values, since the server reads NaN and the infinities back as null and rejects an
+    out-of-range integer, so the congruence tests cover what both sides can store.
+    """
+    inside = {"lon": 0, "lat": 0}
+
+    def matching(geo_filter: models.Filter, nonfinite: dict) -> list:
+        return matching_ids(
+            geo_filter,
+            {
+                1: {"location": inside},
+                2: {"location": nonfinite},
+                3: {"location": [nonfinite, inside]},  # matches on the valid location
+            },
+        )
+
+    def location_filter(**condition) -> models.Filter:
+        return models.Filter(must=[models.FieldCondition(key="location", **condition)])
+
+    filters = {
+        "radius": location_filter(
+            geo_radius=models.GeoRadius(center=models.GeoPoint(lon=0, lat=0), radius=1000)
+        ),
+        "bounding_box": location_filter(
+            geo_bounding_box=models.GeoBoundingBox(
+                top_left=models.GeoPoint(lon=-1, lat=1),
+                bottom_right=models.GeoPoint(lon=1, lat=-1),
+            )
+        ),
+        "polygon": location_filter(
+            geo_polygon=models.GeoPolygon(
+                exterior=models.GeoLineString(
+                    points=[
+                        models.GeoPoint(lon=-1, lat=-1),
+                        models.GeoPoint(lon=1, lat=-1),
+                        models.GeoPoint(lon=1, lat=1),
+                        models.GeoPoint(lon=-1, lat=1),
+                        models.GeoPoint(lon=-1, lat=-1),
+                    ]
+                )
+            )
+        ),
+    }
+
+    for name, geo_filter in filters.items():
+        for value in (float("nan"), float("inf"), -float("inf"), 10**400):
+            assert matching(geo_filter, {"lon": 0, "lat": value}) == [1, 3], f"{name} lat={value}"
+            assert matching(geo_filter, {"lon": value, "lat": 0}) == [1, 3], f"{name} lon={value}"
+
+
+def test_datetime_range_nanosecond_boundary():
+    """Sub-microsecond digits must not floor a value onto the boundary it sits just
+    above (qdrant-client#1526). ``.000000001`` truncates to ``.000000`` in Python
+    datetime, which used to make it equal the boundary for both ``lte`` and ``gt``.
+    """
+    boundary = "2024-01-01T00:00:00Z"
+    payloads = {
+        1: {"t": "2024-01-01T00:00:00.000000001Z"},  # 1 ns after midnight
+        2: {"t": "2024-01-01T00:00:00.000000Z"},  # exactly midnight
+        3: {"t": "2023-12-31T23:59:59.999999Z"},  # 1 us before midnight
+        4: {"t": "2024-01-01T00:00:00.5Z"},  # half a second after midnight
+    }
+
+    def ids(**comparison) -> list:
+        flt = models.Filter(
+            must=[models.FieldCondition(key="t", range=models.DatetimeRange(**comparison))]
+        )
+        return matching_ids(flt, payloads)
+
+    # 1 ns after the boundary: must NOT satisfy lte, MUST satisfy gt/gte
+    assert ids(lte=boundary) == [2, 3]
+    assert ids(gt=boundary) == [1, 4]
+    assert ids(gte=boundary) == [1, 2, 4]
+    assert ids(lt=boundary) == [3]
+
+
+def test_datetime_range_exact_microsecond_equality():
+    """A value with exactly 6 fractional digits equals the microsecond boundary and
+    must match both lte and gte, but not lt or gt."""
+    boundary = "2024-01-01T00:00:00.000000Z"
+    payloads = {
+        1: {"t": "2024-01-01T00:00:00.000000Z"},
+    }
+
+    def ids(**comparison) -> list:
+        flt = models.Filter(
+            must=[models.FieldCondition(key="t", range=models.DatetimeRange(**comparison))]
+        )
+        return matching_ids(flt, payloads)
+
+    assert ids(lte=boundary) == [1]
+    assert ids(gte=boundary) == [1]
+    assert ids(lt=boundary) == []
+    assert ids(gt=boundary) == []
