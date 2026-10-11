@@ -556,10 +556,12 @@ class LocalCollection:
             return res
         elif isinstance(payload, list):
             res_array = []
-            path = path + "[]"
-            for idx, value in enumerate(payload):
-                if predicate(path):
-                    res_array.append(cls._filter_payload(value, predicate, path))
+            # List elements inherit the parent path (no "[]" suffix) so that
+            # patterns like "a.b" correctly match "b" inside each list element.
+            # The dict-level predicate already decided to include this list;
+            # inner keys are filtered recursively.
+            for value in payload:
+                res_array.append(cls._filter_payload(value, predicate, path))
             return res_array
         else:
             return payload
