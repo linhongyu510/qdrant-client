@@ -2369,12 +2369,7 @@ class LocalCollection:
         if not search_results:
             return []
 
-        # distance matrix between candidates
-        candidate_distance_matrix: dict[
-            tuple[models.ExtendedPointId, models.ExtendedPointId], float
-        ] = {}
-
-        candidate_vectors = []
+        candidate_vectors: list[Any] = []
         candidate_ids = []
         candidates: list[models.ScoredPoint] = []
 
@@ -2400,24 +2395,33 @@ class LocalCollection:
             if not isinstance(query_vector, SparseVector)
             else sort_sparse_vector(query_vector)
         )
+        vectors: list[Any] | types.NumpyArray = candidate_vectors
 
-        for candidate_id, candidate_vector in zip(candidate_ids, candidate_vectors):
+        # Cosine normalizes its candidate arrays in place. Keep its original row-wise
+        # evaluation order to preserve near ties, using a compact array instead of
+        # a dictionary of point-id pairs. Other metrics only score selected columns.
+        cosine_similarities = (
+            np.empty((len(candidate_ids), len(candidate_ids)), dtype=np.float64)
+            if distance == models.Distance.COSINE
+            else None
+        )
+
+        for candidate_index, (candidate_id, candidate_vector) in enumerate(
+            zip(candidate_ids, candidate_vectors)
+        ):
             if isinstance(candidate_vector, list) and isinstance(candidate_vector[0], float):
                 candidate_vector_np = np.array(candidate_vector)
-                if not isinstance(candidate_vectors, np.ndarray):
-                    candidate_vectors = np.array(candidate_vectors)
-                nearest_candidates = calculate_distance_core(
-                    candidate_vector_np, candidate_vectors, distance
-                ).tolist()
+                if not isinstance(vectors, np.ndarray):
+                    vectors = np.array(candidate_vectors)
+                if cosine_similarities is not None:
+                    cosine_similarities[candidate_index] = calculate_distance_core(
+                        candidate_vector_np, vectors, distance
+                    )
                 query_raw_similarities[candidate_id] = calculate_distance_core(
                     query_vector, candidate_vector_np[np.newaxis, :], distance
                 ).tolist()[0]
             elif isinstance(candidate_vector, SparseVector):
-                nearest_candidates = calculate_distance_sparse(
-                    candidate_vector,
-                    candidate_vectors,
-                    empty_is_zero=True,
-                ).tolist()
+                assert isinstance(query_vector, SparseVector)
                 query_raw_similarities[candidate_id] = calculate_distance_sparse(
                     query_vector,
                     [candidate_vector],
@@ -2425,19 +2429,16 @@ class LocalCollection:
                 ).tolist()[0]
             else:
                 candidate_vector_np = np.array(candidate_vector)
-                if not isinstance(candidate_vectors[0], np.ndarray):
-                    candidate_vectors = [np.array(multivec) for multivec in candidate_vectors]
-                nearest_candidates = calculate_multi_distance_core(
-                    candidate_vector_np,
-                    candidate_vectors,
-                    distance,
-                ).tolist()
+                assert isinstance(vectors, list)
+                if not isinstance(vectors[0], np.ndarray):
+                    vectors = [np.array(multivec) for multivec in candidate_vectors]
+                if cosine_similarities is not None:
+                    cosine_similarities[candidate_index] = calculate_multi_distance_core(
+                        candidate_vector_np, vectors, distance
+                    )
                 query_raw_similarities[candidate_id] = calculate_multi_distance_core(
                     query_vector, [candidate_vector_np], distance
                 ).tolist()[0]
-
-            for i in range(len(candidate_ids)):
-                candidate_distance_matrix[(candidate_id, candidate_ids[i])] = nearest_candidates[i]
 
         # Core keeps the pending candidates in an insertion-ordered set and removes the chosen
         # one with `swap_remove`, which moves the last element into the freed slot. It then picks
@@ -2451,22 +2452,41 @@ class LocalCollection:
             [query_raw_similarities[candidate_ids[index]] for index in pending]
         )
         selected = [swap_remove(pending, seed_position)]
+        # Keep only the maximum similarity to the selected set for each candidate.
+        # Each new selection needs one update, rather than rescanning the selected set.
+        max_similarities = [float("-inf")] * len(candidate_ids)
 
         while len(selected) < limit and len(pending) > 0:
+            selected_vector = vectors[selected[-1]]
+            if cosine_similarities is not None:
+                similarities = cosine_similarities[:, selected[-1]].tolist()
+            elif isinstance(vectors, np.ndarray):
+                assert distance is not None
+                similarities = calculate_distance_core(selected_vector, vectors, distance).tolist()
+            elif isinstance(selected_vector, SparseVector):
+                similarities = calculate_distance_sparse(
+                    selected_vector, vectors, empty_is_zero=True
+                ).tolist()
+            else:
+                # MaxSim is asymmetric: the pending candidate must remain the query.
+                assert distance is not None
+                similarities = [0.0] * len(candidate_ids)
+                for pending_index in pending:
+                    similarities[pending_index] = calculate_multi_distance_core(
+                        vectors[pending_index], [selected_vector], distance
+                    ).tolist()[0]
+
             mmr_scores = []
 
             for pending_index in pending:
                 relevance_score = query_raw_similarities[candidate_ids[pending_index]]
-                similarities_to_selected = []
-                for selected_index in selected:
-                    similarities_to_selected.append(
-                        candidate_distance_matrix[
-                            (candidate_ids[pending_index], candidate_ids[selected_index])
-                        ]
-                    )
-                max_similarity_to_selected = max(similarities_to_selected)
+                max_similarities[pending_index] = (
+                    similarities[pending_index]
+                    if len(selected) == 1
+                    else max(max_similarities[pending_index], similarities[pending_index])
+                )
                 mmr_score = (
-                    lambda_ * relevance_score - (1.0 - lambda_) * max_similarity_to_selected
+                    lambda_ * relevance_score - (1.0 - lambda_) * max_similarities[pending_index]
                 )
                 mmr_scores.append(mmr_score)
 
