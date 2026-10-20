@@ -3220,15 +3220,34 @@ class LocalCollection:
                 )
 
         elif isinstance(update_op, models.SetPayloadOperation):
-            if update_op.set_payload.key is not None:
-                parse_json_path(update_op.set_payload.key)
+            sp = update_op.set_payload
+            if not sp.points and sp.filter is None:
+                raise ValueError("Empty update request: no points or filter specified")
+            if sp.key is not None:
+                parse_json_path(sp.key)
+
+        elif isinstance(update_op, models.OverwritePayloadOperation):
+            op = update_op.overwrite_payload
+            if not op.points and op.filter is None:
+                raise ValueError("Empty update request: no points or filter specified")
 
         elif isinstance(update_op, models.DeletePayloadOperation):
-            for key in update_op.delete_payload.keys:
+            dp = update_op.delete_payload
+            if not dp.points and dp.filter is None:
+                raise ValueError("Empty update request: no points or filter specified")
+            for key in dp.keys:
                 parse_json_path(key)
 
         elif isinstance(update_op, models.DeleteVectorsOperation):
-            self._validate_vector_names(update_op.delete_vectors.vector)
+            dv = update_op.delete_vectors
+            if not dv.points and dv.filter is None:
+                raise ValueError("Empty update request: no points or filter specified")
+            self._validate_vector_names(dv.vector)
+
+        elif isinstance(update_op, models.ClearPayloadOperation):
+            selector = update_op.clear_payload
+            if isinstance(selector, models.PointIdsList) and not selector.points:
+                raise ValueError("Empty update request: no points or filter specified")
 
     def batch_update_points(
         self,

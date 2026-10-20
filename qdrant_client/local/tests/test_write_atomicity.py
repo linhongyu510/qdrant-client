@@ -172,3 +172,45 @@ def test_wrong_vector_dimension_is_rejected_before_writing(vectors_config, good,
         collection.update_vectors([models.PointVectors(id=1, vector=bad)])
 
     assert collection._get_vectors(idx=0, with_vectors=True) == good
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        models.SetPayloadOperation(
+            set_payload=models.SetPayload(payload={"p": 1}, points=[])
+        ),
+        models.SetPayloadOperation(
+            set_payload=models.SetPayload(payload={"p": 1})
+        ),
+        models.OverwritePayloadOperation(
+            overwrite_payload=models.SetPayload(payload={"p": 1}, points=[])
+        ),
+        models.DeletePayloadOperation(
+            delete_payload=models.DeletePayload(keys=["p"], points=[])
+        ),
+        models.DeleteVectorsOperation(
+            delete_vectors=models.DeleteVectors(points=[], vector=["a"])
+        ),
+        models.ClearPayloadOperation(
+            clear_payload=models.PointIdsList(points=[])
+        ),
+    ],
+    ids=[
+        "set_payload_empty_points",
+        "set_payload_no_selector",
+        "overwrite_payload_empty_points",
+        "delete_payload_empty_points",
+        "delete_vectors_empty_points",
+        "clear_payload_empty_ids",
+    ],
+)
+def test_empty_selector_update_is_rejected(operation) -> None:
+    """An operation that targets no points must fail fast, like the server (issue #1511)."""
+    collection = batch_collection()
+
+    with pytest.raises(ValueError, match="Empty update request"):
+        collection.batch_update_points([operation])
+
+    # the rejected batch applied nothing
+    assert collection.payload[0] == {"p": "orig"}
